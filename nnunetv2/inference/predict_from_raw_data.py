@@ -2,6 +2,7 @@ import inspect
 import itertools
 import multiprocessing
 import os
+import time
 from copy import deepcopy
 from time import sleep
 from typing import Tuple, Union, List, Optional
@@ -43,13 +44,15 @@ class nnUNetPredictor(object):
                  device: torch.device = torch.device('cuda'),
                  verbose: bool = False,
                  verbose_preprocessing: bool = False,
-                 allow_tqdm: bool = True):
+                 allow_tqdm: bool = True,
+                 label_slicing_number: int or None = None):
         self.verbose = verbose
         self.verbose_preprocessing = verbose_preprocessing
         self.allow_tqdm = allow_tqdm
+        self.label_slicing_number = label_slicing_number
 
         self.plans_manager, self.configuration_manager, self.list_of_parameters, self.network, self.dataset_json, \
-        self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
+            self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
 
         self.tile_step_size = tile_step_size
         self.use_gaussian = use_gaussian
@@ -137,7 +140,7 @@ class nnUNetPredictor(object):
         self.label_manager = plans_manager.get_label_manager(dataset_json)
         allow_compile = True
         allow_compile = allow_compile and ('nnUNet_compile' in os.environ.keys()) and (
-                    os.environ['nnUNet_compile'].lower() in ('true', '1', 't'))
+                os.environ['nnUNet_compile'].lower() in ('true', '1', 't'))
         allow_compile = allow_compile and not isinstance(self.network, OptimizedModule)
         if isinstance(self.network, DistributedDataParallel):
             allow_compile = allow_compile and isinstance(self.network.module, OptimizedModule)
@@ -282,9 +285,9 @@ class nnUNetPredictor(object):
     def get_data_iterator_from_raw_npy_data(self,
                                             image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
                                             segs_from_prev_stage_or_list_of_segs_from_prev_stage: Union[None,
-                                                                                                        np.ndarray,
-                                                                                                        List[
-                                                                                                            np.ndarray]],
+                                            np.ndarray,
+                                            List[
+                                                np.ndarray]],
                                             properties_or_list_of_properties: Union[dict, List[dict]],
                                             truncated_ofname: Union[str, List[str], None],
                                             num_processes: int = 3):
@@ -321,9 +324,9 @@ class nnUNetPredictor(object):
     def predict_from_list_of_npy_arrays(self,
                                         image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
                                         segs_from_prev_stage_or_list_of_segs_from_prev_stage: Union[None,
-                                                                                                    np.ndarray,
-                                                                                                    List[
-                                                                                                        np.ndarray]],
+                                        np.ndarray,
+                                        List[
+                                            np.ndarray]],
                                         properties_or_list_of_properties: Union[dict, List[dict]],
                                         truncated_ofname: Union[str, List[str], None],
                                         num_processes: int = 3,
@@ -546,7 +549,7 @@ class nnUNetPredictor(object):
                                                        data: torch.Tensor,
                                                        slicers,
                                                        do_on_device: bool = True,
-                                                       ):
+                                                       label_slicing: Tuple[int, int] or None = None):
         predicted_logits = n_predictions = prediction = gaussian = workon = None
         results_device = self.device if do_on_device else torch.device('cpu')
 
@@ -556,19 +559,24 @@ class nnUNetPredictor(object):
             # move data to device
             if self.verbose:
                 print(f'move image to device {results_device}')
-            data = data.to(results_device)
+            data = data.to(self.device)
 
             # preallocate arrays
             if self.verbose:
                 print(f'preallocating results arrays on device {results_device}')
-            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
-                                           dtype=torch.half,
-                                           device=results_device)
-            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+            if label_slicing is not None:
+                predicted_logits = torch.zeros((label_slicing[1] - label_slicing[0], *data.shape[1:]),
+                                               dtype=torch.half,
+                                               device=results_device)
+            else:
+                predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                                               dtype=torch.half,
+                                               device=results_device)
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=self.device)
             if self.use_gaussian:
                 gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
                                             value_scaling_factor=10,
-                                            device=results_device)
+                                            device=self.device)
 
             if self.verbose: print('running prediction')
             if not self.allow_tqdm and self.verbose: print(f'{len(slicers)} steps')
@@ -576,12 +584,17 @@ class nnUNetPredictor(object):
                 workon = data[sl][None]
                 workon = workon.to(self.device, non_blocking=False)
 
-                prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+                prediction = self._internal_maybe_mirror_and_predict(workon)[0]
 
-                predicted_logits[sl] += (prediction * gaussian if self.use_gaussian else prediction)
+                if label_slicing is not None:
+                    predicted_logits[sl] += (prediction * gaussian if self.use_gaussian else prediction).to(
+                        results_device)[label_slicing[0]: label_slicing[1]]
+                else:
+                    predicted_logits[sl] += (prediction * gaussian if self.use_gaussian else prediction).to(
+                        results_device)
                 n_predictions[sl[1:]] += (gaussian if self.use_gaussian else 1)
 
-            predicted_logits /= n_predictions
+            predicted_logits /= n_predictions.to(results_device)
             # check for infs
             if torch.any(torch.isinf(predicted_logits)):
                 raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
@@ -592,6 +605,10 @@ class nnUNetPredictor(object):
             empty_cache(self.device)
             empty_cache(results_device)
             raise e
+
+        del n_predictions, prediction, gaussian, workon, data
+        empty_cache(self.device)
+
         return predicted_logits
 
     def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
@@ -626,8 +643,27 @@ class nnUNetPredictor(object):
                 if self.perform_everything_on_device and self.device != 'cpu':
                     # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
                     try:
-                        predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
-                                                                                               self.perform_everything_on_device)
+                        if self.label_slicing_number is not None:
+                            start_time = time.time()
+                            slices = [(i, min(i + self.label_slicing_number, self.label_manager.num_segmentation_heads))
+                                      for i in
+                                      range(0, self.label_manager.num_segmentation_heads, self.label_slicing_number)]
+                            predicted_logits_final = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                                                                 dtype=torch.half, device="cpu")
+                            for s in slices:
+                                print(f"Predicting label slices {s}")
+                                predicted_logits = self._internal_predict_sliding_window_return_logits(
+                                    data, slicers, self.perform_everything_on_device, label_slicing=s)
+                                predicted_logits_final[s[0]:s[1]] = predicted_logits
+                                del predicted_logits
+                                empty_cache(self.device)
+
+                            # predicted_logits = torch.cat(predicted_logits_list, dim=0)
+                            predicted_logits = predicted_logits_final
+                            print(f"Took {time.time() - start_time} seconds.")
+                        else:
+                            predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                                   self.perform_everything_on_device)
                     except RuntimeError:
                         print(
                             'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
